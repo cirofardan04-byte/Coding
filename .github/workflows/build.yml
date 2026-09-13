@@ -1,149 +1,126 @@
-name: Build Native APK - Panel
+const { readJson, writeJson, JOBS_FILE } = require('../utils/database');
+const { uploadToRelease, deleteRelease, dispatchWorkflow, getLatestRun, getRunById, getArtifacts, downloadArtifactZip, makeProgressBar, randomJobId } = require('../utils/github');
+const config = require('../config');
 
-on:
-  workflow_dispatch:
-    inputs:
-      app_name:
-        description: 'Nama Aplikasi'
-        required: true
-        default: 'SyncXxX'
-      package_name:
-        description: 'Package Name (com.xxx.xxx)'
-        required: true
-        default: 'com.example.app'
-      version_name:
-        description: 'Version Name'
-        required: true
-        default: '1.0.0'
-      version_code:
-        description: 'Version Code (angka)'
-        required: true
-        default: '1'
-      build_type:
-        description: 'Build Type'
-        required: true
-        default: 'release'
-        type: choice
-        options:
-          - release
-          - debug
-      chat_id:
-        description: 'Telegram Chat ID'
-        required: true
-      bot_token:
-        description: 'Telegram Bot Token'
-        required: true
+async function startBuildJob(ctx, statusMsg, zipBuffer) {
+    const jobId = randomJobId();
 
-jobs:
-  build:
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-      actions: write
+    await ctx.telegram.editMessageText(statusMsg.chat.id, statusMsg.message_id, undefined,
+        `<blockquote>⬆️ <b>Upload ke GitHub Release...</b>\n\nJob ID: <code>${jobId}</code>\n⏳ Mohon tunggu, file sedang diupload...</blockquote>`,
+        { parse_mode: 'HTML' }).catch(() => {});
 
-    steps:
-      - name: Notify Start
-        run: |
-          curl -s -X POST "https://api.telegram.org/bot${{ inputs.bot_token }}/sendMessage" \
-            -d chat_id="${{ inputs.chat_id }}" \
-            -d parse_mode="HTML" \
-            -d text="⏳ <b>Build dimulai!</b>%0A%0A🏷️ App: <code>${{ inputs.app_name }}</code>%0A📦 Package: <code>${{ inputs.package_name }}</code>%0A🔢 Versi: <code>${{ inputs.version_name }}</code> (code: ${{ inputs.version_code }})%0A🔨 Tipe: <code>${{ inputs.build_type }}</code>"
+    // Upload via GitHub Releases (tidak ada batas 1MB seperti Contents API)
+    const { releaseId, downloadUrl, tag } = await uploadToRelease(jobId, zipBuffer);
 
-      - name: Checkout
-        uses: actions/checkout@v4
+    await ctx.telegram.editMessageText(statusMsg.chat.id, statusMsg.message_id, undefined,
+        `<blockquote>🚀 <b>Menjalankan workflow...</b>\n\nJob ID: <code>${jobId}</code></blockquote>`,
+        { parse_mode: 'HTML' }).catch(() => {});
 
-      - name: Set up JDK 17
-        uses: actions/setup-java@v4
-        with:
-          java-version: '17'
-          distribution: 'temurin'
+    // Kirim input sesuai yang dideklarasikan workflow_dispatch di flutter_build.yml
+    // (zip_url, tag, build_type, only_analyze) — JANGAN kirim job_id, GitHub akan
+    // menolak dengan 422 "Unexpected inputs provided" kalau ada input yang tidak terdaftar.
+    await dispatchWorkflow(config.GITHUB_WORKFLOW, { zip_url: downloadUrl, tag, build_type: 'release' });
 
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.11'
+    let runId = null;
+    for (let i = 0; i < 8; i++) {
+        await new Promise(r => setTimeout(r, 3000));
+        const run = await getLatestRun(config.GITHUB_WORKFLOW);
+        if (run) { runId = run.id; break; }
+    }
 
-      - name: Install Pillow
-        run: pip install Pillow
+    const jobs = readJson(JOBS_FILE);
+    jobs[jobId] = { job_id: jobId, release_id: releaseId, release_tag: tag, run_id: runId, user_id: ctx.from.id, created_at: new Date().toISOString() };
+    writeJson(JOBS_FILE, jobs);
 
-      - name: Generate App Icons
-        run: python3 generate_icons.py
+    await ctx.telegram.editMessageText(statusMsg.chat.id, statusMsg.message_id, undefined,
+        `<blockquote>✅ <b>Build dimulai!</b>\n\nJob ID: <code>${jobId}</code>\n\n⚠️ Simpan Job ID ini untuk cek status dan ambil APK.</blockquote>`,
+        { parse_mode: 'HTML', reply_markup: { inline_keyboard: [[{ text: '📊 Cek Status', callback_data: 'build_status', style: 'primary' }], [{ text: '🏠 Menu Utama', callback_data: 'main_menu', style: 'primary' }]] } }
+    ).catch(() => {});
 
-      - name: Patch AndroidManifest.xml
-        run: |
-          MANIFEST="android/app/src/main/AndroidManifest.xml"
-          if [ -f "$MANIFEST" ]; then
-            OLD_PKG=$(grep -oP '(?<=package=")[^"]+' "$MANIFEST" | head -1)
-            if [ -n "$OLD_PKG" ]; then
-              sed -i "s|$OLD_PKG|${{ inputs.package_name }}|g" "$MANIFEST"
-              echo "Package: $OLD_PKG -> ${{ inputs.package_name }}"
-            fi
-            sed -i "s|android:label=\"[^\"]*\"|android:label=\"${{ inputs.app_name }}\"|g" "$MANIFEST"
-          fi
+    const progressMsg = await ctx.reply(
+        `<blockquote>⏳ <b>Monitoring build...</b>\n\nJob ID: <code>${jobId}</code>\n${makeProgressBar(5)}</blockquote>`,
+        { parse_mode: 'HTML' });
+    trackBuildProgress(ctx, progressMsg.chat.id, progressMsg.message_id, jobId);
+}
 
-      - name: Patch build.gradle
-        run: |
-          GRADLE="android/app/build.gradle"
-          if [ -f "$GRADLE" ]; then
-            sed -i "s|applicationId \"[^\"]*\"|applicationId \"${{ inputs.package_name }}\"|" "$GRADLE"
-            sed -i "s|versionCode [0-9]*|versionCode ${{ inputs.version_code }}|" "$GRADLE"
-            sed -i "s|versionName \"[^\"]*\"|versionName \"${{ inputs.version_name }}\"|" "$GRADLE"
-          fi
+async function trackBuildProgress(ctx, chatId, msgId, jobId) {
+    const steps = [5, 15, 25, 35, 45, 55, 65, 75, 85, 92, 97];
+    let idx = 0;
+    const maxWait = 30 * 60 * 1000;
+    const start = Date.now();
 
-      - name: Patch strings.xml
-        run: |
-          STRINGS="android/app/src/main/res/values/strings.xml"
-          if [ -f "$STRINGS" ]; then
-            sed -i "s|<string name=\"app_name\">[^<]*</string>|<string name=\"app_name\">${{ inputs.app_name }}</string>|g" "$STRINGS"
-          fi
+    while (Date.now() - start < maxWait) {
+        const jobs = readJson(JOBS_FILE);
+        const job = jobs[jobId];
+        if (!job?.run_id) { await new Promise(r => setTimeout(r, 5000)); idx = Math.min(idx + 1, 2); continue; }
 
-      - name: Setup Gradle Wrapper
-        run: |
-          curl -L -o android/gradle/wrapper/gradle-wrapper.jar \
-            "https://github.com/gradle/gradle/raw/v8.4.0/gradle-wrapper.jar"
-          chmod +x android/gradlew
+        try {
+            const run = await getRunById(job.run_id);
+            if (run.status === 'completed') {
+                const icon = run.conclusion === 'success' ? '✅' : '❌';
+                const label = run.conclusion === 'success' ? 'SUCCESS' : `FAILED (${run.conclusion})`;
 
-      - name: Build APK
-        run: |
-          cd android
-          if [ "${{ inputs.build_type }}" = "release" ]; then
-            ./gradlew assembleRelease --no-daemon
-          else
-            ./gradlew assembleDebug --no-daemon
-          fi
+                // Cleanup: hapus release setelah build selesai
+                if (job.release_id && job.release_tag) {
+                    deleteRelease(job.release_id, job.release_tag).catch(() => {});
+                }
 
-      - name: Rename APK
-        run: |
-          mkdir -p output
-          if [ "${{ inputs.build_type }}" = "release" ]; then
-            APK_SRC="android/app/build/outputs/apk/release"
-          else
-            APK_SRC="android/app/build/outputs/apk/debug"
-          fi
-          find "$APK_SRC" -name "*.apk" | head -1 | xargs -I{} cp {} output/${{ inputs.app_name }}_v${{ inputs.version_name }}_${{ inputs.build_type }}.apk
+                await ctx.telegram.editMessageText(chatId, msgId, undefined,
+                    `<blockquote>🏗 <b>HASIL BUILD</b>\n\nJob ID: <code>${jobId}</code>\nStatus: ${run.status}\n${makeProgressBar(100)}\n\n${icon} <b>${label}</b>${run.conclusion === 'success' ? '\n\n📥 Gunakan "Ambil APK" untuk download hasil.' : ''}</blockquote>`,
+                    { parse_mode: 'HTML', reply_markup: { inline_keyboard: [[{ text: '📥 Ambil APK', callback_data: 'build_get_apk', style: 'success' }, { text: '🏗 Menu Build', callback_data: 'menu_build', style: 'primary' }]] } }
+                ).catch(() => {});
+                break;
+            }
+            const pct = steps[Math.min(idx, steps.length - 1)];
+            await ctx.telegram.editMessageText(chatId, msgId, undefined,
+                `<blockquote>⏳ <b>Monitoring build...</b>\n\nJob ID: <code>${jobId}</code>\nStatus: <b>${run.status}</b>\n${makeProgressBar(pct)}\n\n⏰ Waktu berjalan: ${Math.floor((Date.now() - start) / 60000)}m</blockquote>`,
+                { parse_mode: 'HTML' }
+            ).catch(() => {});
+        } catch {}
 
-      - name: Upload APK Artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: ${{ inputs.app_name }}-v${{ inputs.version_name }}-${{ inputs.build_type }}
-          path: output/*.apk
-          retention-days: 30
+        await new Promise(r => setTimeout(r, 10000));
+        idx = Math.min(idx + 1, steps.length - 1);
+    }
+}
 
-      - name: Send APK to Telegram
-        run: |
-          APK=$(find output -name "*.apk" | head -1)
-          SIZE=$(du -sh "$APK" | cut -f1)
-          curl -s -X POST "https://api.telegram.org/bot${{ inputs.bot_token }}/sendDocument" \
-            -F chat_id="${{ inputs.chat_id }}" \
-            -F document=@"$APK" \
-            -F parse_mode="HTML" \
-            -F caption="✅ <b>Build Selesai!</b> 🎉%0A%0A🏷️ <b>App:</b> ${{ inputs.app_name }}%0A📦 <b>Package:</b> <code>${{ inputs.package_name }}</code>%0A🔢 <b>Versi:</b> <code>${{ inputs.version_name }}</code> (code: ${{ inputs.version_code }})%0A🔨 <b>Tipe:</b> <code>${{ inputs.build_type }}</code>%0A📁 <b>Size:</b> <code>$SIZE</code>%0A%0A⚡ by @Zyvarno1"
+async function handleBuildProcess(ctx, state, userState, downloadTelegramFile, startBuildJob, isUrl = false) {
+    if (isUrl) {
+        const url = ctx.message.text.trim();
+        if (!url.startsWith('http')) {
+            return ctx.reply(`<blockquote>❌ URL tidak valid!</blockquote>`, { parse_mode: 'HTML', reply_markup: { inline_keyboard: [[{ text: '❌ Batal', callback_data: 'menu_build', style: 'danger' }]] } });
+        }
+        delete userState[ctx.from.id];
+        const statusMsg = await ctx.reply(`<blockquote>⬇️ <b>Mengunduh project...</b></blockquote>`, { parse_mode: 'HTML' });
+        // Fire-and-forget: jangan await supaya tidak kena timeout 90 detik Telegraf
+        (async () => {
+            try {
+                const res = await fetch(url, { headers: { 'User-Agent': 'Mozilla/5.0' } });
+                if (!res.ok) throw new Error(`Download gagal (${res.status})`);
+                const buffer = Buffer.from(await res.arrayBuffer());
+                await ctx.telegram.editMessageText(statusMsg.chat.id, statusMsg.message_id, undefined, `<blockquote>⬆️ <b>Upload project ke GitHub Release...</b></blockquote>`, { parse_mode: 'HTML' }).catch(() => {});
+                await startBuildJob(ctx, statusMsg, buffer);
+            } catch (e) {
+                await ctx.telegram.editMessageText(statusMsg.chat.id, statusMsg.message_id, undefined, `<blockquote>❌ <b>Gagal:</b> ${e.message}</blockquote>`, { parse_mode: 'HTML' }).catch(() => {});
+            }
+        })();
+        return;
+    }
 
-      - name: Notify Failure
-        if: failure()
-        run: |
-          curl -s -X POST "https://api.telegram.org/bot${{ inputs.bot_token }}/sendMessage" \
-            -d chat_id="${{ inputs.chat_id }}" \
-            -d parse_mode="HTML" \
-            -d text="❌ <b>Build Gagal!</b>%0A%0A🏷️ App: <code>${{ inputs.app_name }}</code>%0A📦 Package: <code>${{ inputs.package_name }}</code>%0A%0A🔗 https://github.com/${{ github.repository }}/actions"
-            
+    const doc = ctx.message.document;
+    if (!doc.file_name?.endsWith('.zip')) {
+        return ctx.reply(`<blockquote>❌ Harus file <b>.zip</b>!</blockquote>`, { parse_mode: 'HTML', reply_markup: { inline_keyboard: [[{ text: '❌ Batal', callback_data: 'menu_build', style: 'danger' }]] } });
+    }
+    delete userState[ctx.from.id];
+    const statusMsg = await ctx.reply(`<blockquote>⬆️ <b>Upload project ke GitHub Release...</b></blockquote>`, { parse_mode: 'HTML' });
+    // Fire-and-forget: jangan await supaya tidak kena timeout 90 detik Telegraf
+    (async () => {
+        try {
+            const buffer = await downloadTelegramFile(ctx, doc.file_id);
+            await startBuildJob(ctx, statusMsg, buffer);
+        } catch (e) {
+            await ctx.telegram.editMessageText(statusMsg.chat.id, statusMsg.message_id, undefined, `<blockquote>❌ <b>Gagal:</b> ${e.message}</blockquote>`, { parse_mode: 'HTML' }).catch(() => {});
+        }
+    })();
+}
+
+module.exports = { handleBuildProcess, startBuildJob, trackBuildProgress };
