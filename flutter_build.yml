@@ -1,0 +1,215 @@
+const config = require('../config');
+function randomJobId() { 
+    return Date.now().toString(36) + Math.random().toString(36).substring(2, 6); 
+}
+
+function ghHeaders(extra = {}, token) {
+    return {
+        Authorization: `Bearer ${token || config.GITHUB_TOKEN}`,
+        'X-GitHub-Api-Version': '2022-11-28',
+        Accept: 'application/vnd.github+json',
+        ...extra,
+    };
+}
+
+async function uploadToRepo(repoPath, buffer, message, target = {}) {
+    const owner = target.owner || config.GITHUB_OWNER;
+    const repo = target.repo || config.GITHUB_REPO;
+    const branch = target.branch || config.GITHUB_BRANCH;
+    const token = target.token; // optional override, defaults to config.GITHUB_TOKEN
+
+    const url = `https://api.github.com/repos/${owner}/${repo}/contents/${repoPath}`;
+    let sha = undefined;
+    try {
+        const checkRes = await fetch(`${url}?ref=${branch}`, { headers: ghHeaders({}, token) });
+        if (checkRes.ok) {
+            const existing = await checkRes.json();
+            sha = existing.sha;
+        }
+    } catch {}
+    const body = { message, content: buffer.toString('base64'), branch };
+    if (sha) body.sha = sha;
+    const res = await fetch(url, {
+        method: 'PUT',
+        headers: ghHeaders({ 'Content-Type': 'application/json' }, token),
+        body: JSON.stringify(body),
+    });
+    if (!res.ok) throw new Error('Upload GitHub gagal: ' + (await res.text()));
+    return await res.json();
+}
+
+// ============================================================
+// Upload file besar via GitHub Releases (tidak ada batasan 1MB)
+// Dipakai untuk upload ZIP project Flutter yang bisa > 1MB.
+// Alur:
+//   1. Buat release baru (tag unik berdasarkan jobId)
+//   2. Upload file sebagai release asset (support hingga 2GB)
+//   3. Return { releaseId, assetId, downloadUrl } untuk dikirim
+//      ke workflow sebagai input zip_url
+// ============================================================
+async function uploadToRelease(jobId, buffer, target = {}) {
+    const owner = target.owner || config.GITHUB_OWNER;
+    const repo = target.repo || config.GITHUB_REPO;
+    const token = target.token;
+    const tag = `build-${jobId}`;
+
+    // 1. Buat draft release dengan tag unik
+    const createRes = await fetch(`https://api.github.com/repos/${owner}/${repo}/releases`, {
+        method: 'POST',
+        headers: ghHeaders({ 'Content-Type': 'application/json' }, token),
+        body: JSON.stringify({
+            tag_name: tag,
+            name: `Build ${jobId}`,
+            body: `Temporary release untuk build job ${jobId}. Akan otomatis dihapus setelah selesai.`,
+            draft: false,
+            prerelease: true,
+        }),
+    });
+    if (!createRes.ok) throw new Error('Gagal buat GitHub Release: ' + (await createRes.text()));
+    const release = await createRes.json();
+    const releaseId = release.id;
+    const uploadUrl = release.upload_url.replace(/{[^}]+}/, ''); // strip template
+
+    // 2. Upload ZIP sebagai release asset
+    const filename = `${jobId}.zip`;
+    const uploadRes = await fetch(`${uploadUrl}?name=${encodeURIComponent(filename)}`, {
+        method: 'POST',
+        headers: ghHeaders({ 'Content-Type': 'application/zip' }, token),
+        body: buffer,
+    });
+    if (!uploadRes.ok) {
+        // Hapus release kalau upload gagal supaya tidak nyampah
+        await fetch(`https://api.github.com/repos/${owner}/${repo}/releases/${releaseId}`, {
+            method: 'DELETE',
+            headers: ghHeaders({}, token),
+        }).catch(() => {});
+        throw new Error('Gagal upload asset ke GitHub Release: ' + (await uploadRes.text()));
+    }
+    const asset = await uploadRes.json();
+
+    return {
+        releaseId,
+        assetId: asset.id,
+        downloadUrl: asset.browser_download_url,
+        tag,
+    };
+}
+
+// Hapus release setelah build selesai (cleanup otomatis)
+async function deleteRelease(releaseId, tag, target = {}) {
+    const owner = target.owner || config.GITHUB_OWNER;
+    const repo = target.repo || config.GITHUB_REPO;
+    const token = target.token;
+
+    // Hapus release
+    await fetch(`https://api.github.com/repos/${owner}/${repo}/releases/${releaseId}`, {
+        method: 'DELETE',
+        headers: ghHeaders({}, token),
+    }).catch(() => {});
+
+    // Hapus tag yang dibuat bersama release
+    await fetch(`https://api.github.com/repos/${owner}/${repo}/git/refs/tags/${tag}`, {
+        method: 'DELETE',
+        headers: ghHeaders({}, token),
+    }).catch(() => {});
+}
+
+async function dispatchWorkflow(workflowFile, inputs) {
+    const url = `https://api.github.com/repos/${config.GITHUB_OWNER}/${config.GITHUB_REPO}/actions/workflows/${workflowFile}/dispatches`;
+    const res = await fetch(url, {
+        method: 'POST',
+        headers: ghHeaders({ 'Content-Type': 'application/json' }),
+        body: JSON.stringify({ ref: config.GITHUB_BRANCH, inputs }),
+    });
+    if (res.status === 422) {
+        const errText = await res.text();
+        let parsed = {};
+        try { parsed = JSON.parse(errText); } catch {}
+        if ((parsed.message || '').includes("does not have 'workflow_dispatch'")) {
+            throw new Error(
+                '\u274C File workflow "' + workflowFile + '" di repo GitHub tidak punya trigger workflow_dispatch.\n\n' +
+                'Solusi: Upload file flutter_build.yml dari folder SC ini ke folder .github/workflows/ di repo ' +
+                config.GITHUB_OWNER + '/' + config.GITHUB_REPO + ' (branch ' + config.GITHUB_BRANCH + ').'
+            );
+        }
+        throw new Error('Trigger workflow gagal (422): ' + errText);
+    }
+    if (!(res.status === 204 || res.ok)) throw new Error('Trigger workflow gagal: ' + (await res.text()));
+}
+
+async function getLatestRun(workflowFile) {
+    const url = `https://api.github.com/repos/${config.GITHUB_OWNER}/${config.GITHUB_REPO}/actions/workflows/${workflowFile}/runs?branch=${config.GITHUB_BRANCH}&event=workflow_dispatch&per_page=5`;
+    const res = await fetch(url, { headers: ghHeaders() });
+    if (!res.ok) return null;
+    const data = await res.json();
+    const runs = data.workflow_runs || [];
+    return runs.find(r => new Date(r.created_at).getTime() >= Date.now() - 120000) || null;
+}
+
+async function getRunById(runId) {
+    const res = await fetch(`https://api.github.com/repos/${config.GITHUB_OWNER}/${config.GITHUB_REPO}/actions/runs/${runId}`, { headers: ghHeaders() });
+    if (!res.ok) throw new Error('Gagal ambil status run');
+    return await res.json();
+}
+
+async function getArtifacts(runId) {
+    const res = await fetch(`https://api.github.com/repos/${config.GITHUB_OWNER}/${config.GITHUB_REPO}/actions/runs/${runId}/artifacts`, { headers: ghHeaders() });
+    if (!res.ok) return [];
+    const data = await res.json();
+    return (data.artifacts || []).filter(a => !a.expired);
+}
+
+async function downloadArtifactZip(artifactId) {
+    const res = await fetch(`https://api.github.com/repos/${config.GITHUB_OWNER}/${config.GITHUB_REPO}/actions/artifacts/${artifactId}/zip`, { headers: ghHeaders() });
+    if (!res.ok) throw new Error('Gagal download artifact');
+    return Buffer.from(await res.arrayBuffer());
+}
+
+async function downloadTelegramFile(ctx, fileId) {
+    let link;
+    try {
+        link = await ctx.telegram.getFileLink(fileId);
+    } catch (e) {
+        const msg = e.description || e.message || '';
+        // Bot API resmi cuma bisa getFile untuk file <= 2GB.
+        // Untuk file lebih besar, fallback ke MTProto (GramJS) kalau aktif.
+        if (/file is too big/i.test(msg)) {
+            try {
+                const { downloadViaMtproto } = require('./gramjs');
+                return await downloadViaMtproto(ctx.chat.id, ctx.message.message_id);
+            } catch (e2) {
+                throw new Error(`File terlalu besar (>2GB) untuk Bot API, dan fallback MTProto gagal: ${e2.message}`);
+            }
+        }
+        throw new Error(`Gagal ambil link file dari Telegram: ${msg}`);
+    }
+    let res;
+    try {
+        res = await fetch(link.href);
+    } catch (e) {
+        throw new Error(`Gagal konek ke server file Telegram: ${e.message}`);
+    }
+    if (!res.ok) throw new Error(`Gagal download file Telegram (HTTP ${res.status})`);
+    return Buffer.from(await res.arrayBuffer());
+}
+
+function makeProgressBar(pct) {
+    const total = 16;
+    const filled = Math.round((pct / 100) * total);
+    return `[${'█'.repeat(filled)}${'░'.repeat(total - filled)}] ${pct}%`;
+}
+
+module.exports = {
+    randomJobId,
+    ghHeaders,
+    uploadToRepo,
+    uploadToRelease,
+    deleteRelease,
+    dispatchWorkflow,
+    getLatestRun,
+    getRunById,
+    getArtifacts,
+    downloadArtifactZip,
+    downloadTelegramFile,
+    makeProgressBar
+};
